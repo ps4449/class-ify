@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from utils.features import format_features
 from utils.transcript_processor import Transcript, format_timestamp
 
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 MAX_RETRIES = 4
 RETRYABLE_CODES = {429, 500, 503}
 
