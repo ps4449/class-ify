@@ -217,4 +217,8 @@ marimo/_lsp/
 __marimo__/
 
 # Streamlit
-.streamlit/secrets.toml
+.streamlit/
+.streamlit/config.toml
+
+# Data
+data/
