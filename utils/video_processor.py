@@ -8,6 +8,7 @@ from pathlib import Path
 import cv2
 from PIL import Image
 
+# Shared by train.py and the app; changing them requires retraining the classifier.
 DEFAULT_TARGET_INTERVAL_S = 20
 DEFAULT_MAX_FRAMES = 60
 DEFAULT_MAX_WIDTH = 768

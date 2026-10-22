@@ -19,6 +19,7 @@ from utils.feedback_parser import GroundTruth, parse_feedback_pdf, resolve_groun
 from utils.pipeline import PipelineResult, cache_key, load_cached, run_pipeline, save_cached
 from utils.transcriber import DEFAULT_WHISPER_MODEL
 from utils.transcript_processor import Transcript, load_transcript_file, load_transcript_text
+from utils.video_processor import DEFAULT_MAX_FRAMES, DEFAULT_TARGET_INTERVAL_S
 
 load_dotenv()
 
@@ -26,17 +27,17 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 FEEDBACK_PDF = DATA_DIR / "feedbacks.pdf"
 VIDEO_TYPES = ["mp4", "mov", "mkv", "webm"]
 TRANSCRIPT_TYPES = ["vtt", "txt"]
-WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3"]
 
-st.set_page_config(page_title="8x8 Class Quality Evaluator", page_icon="🎓", layout="wide")
+st.set_page_config(page_title="Class-ify", layout="wide")
 
 
-def get_api_key() -> str | None:
+def get_setting(name: str, default: str = "") -> str:
+    """Streamlit secrets first (hosted), then environment / .env (local)."""
     try:
-        key = st.secrets.get("GEMINI_API_KEY")
+        value = st.secrets.get(name)
     except Exception:  # no secrets.toml
-        key = None
-    return key or os.getenv("GEMINI_API_KEY")
+        value = None
+    return value or os.getenv(name) or default
 
 
 @st.cache_resource
@@ -69,10 +70,12 @@ def category_badge(label: str) -> str:
 
 # ---------- Sidebar ----------
 
-api_key = get_api_key()
+api_key = get_setting("GEMINI_API_KEY")
+model = get_setting("GEMINI_MODEL", DEFAULT_MODEL)
+whisper_model = get_setting("WHISPER_MODEL", DEFAULT_WHISPER_MODEL)
 bundle = cached_bundle()
 with st.sidebar:
-    st.header("Configuration")
+    st.header("Status")
     if api_key:
         st.success("Gemini API key loaded")
     else:
@@ -88,22 +91,17 @@ with st.sidebar:
         (st.success if reliable else st.warning)(status)
     else:
         st.warning("No local classifier found. Run `python train.py`.")
-    model = st.text_input("Gemini model", value=DEFAULT_MODEL)
-    whisper_model = st.selectbox(
-        "Whisper model (used when no transcript)", WHISPER_MODELS,
-        index=WHISPER_MODELS.index(DEFAULT_WHISPER_MODEL),
+    st.markdown(
+        f"- Gemini model: `{model}`\n"
+        f"- Whisper model (no transcript): `{whisper_model}`\n"
+        f"- Frames: every {DEFAULT_TARGET_INTERVAL_S}s, max {DEFAULT_MAX_FRAMES} (fixed to match training)"
     )
-    target_interval = st.slider("Frame interval (s)", 15, 30, 20)
-    max_frames = st.slider("Max frames per video", 30, 120, 60)
-    rpm = st.number_input("Requests per minute (batch)", 1, 15, 10)
     st.caption("Frames and audio stay local. Gemini receives only the redacted transcript and numeric signals.")
 
-st.title("🎓 8x8 Class Quality Evaluator")
-st.caption("Local analysis + redacted transcript → Gemini → quality category with evidence-based observations.")
+st.title("Class-ify")
 
 ground_truth = load_ground_truth(str(FEEDBACK_PDF))
 samples = load_samples(str(DATA_DIR))
-local_kwargs = dict(target_interval_s=target_interval, max_frames=max_frames, whisper_model=whisper_model)
 
 
 def render_result(result: PipelineResult):
@@ -291,7 +289,7 @@ with tab_eval:
                     classifier_override=override,
                     video_name=video_name,
                     on_step=lambda msg: status.update(label=msg),
-                    **local_kwargs,
+                    whisper_model=whisper_model,
                 )
                 status.update(label="Done", state="complete")
             except Exception as exc:
@@ -307,8 +305,12 @@ with tab_eval:
 
 with tab_batch:
     labelled = [s for s in samples if s.video_id in ground_truth]
+    if not samples:
+        st.info(f"No dataset found in `{DATA_DIR}`. The batch benchmark runs locally only.")
     selected = st.multiselect("Recordings", samples, default=labelled, format_func=lambda s: s.label)
-    force = st.checkbox("Ignore cached results")
+    with st.expander("Advanced"):
+        force = st.checkbox("Ignore cached results")
+        rpm = st.number_input("Gemini requests per minute (free tier allows 15)", 1, 15, 10)
     st.caption("Training samples use leave-one-out classifier predictions, so Gemini never sees an in-sample prior.")
 
     if st.button("Run batch", type="primary", disabled=not (api_key and selected)):
@@ -319,7 +321,7 @@ with tab_batch:
             progress.progress(i / len(selected), text=f"Evaluating {s.label}")
             override = bundle["loocv"].get(s.key) if bundle else None
             key = cache_key(
-                s.key, model, target_interval, max_frames, bundle["trained_at"] if bundle else None
+                s.key, model, DEFAULT_TARGET_INTERVAL_S, DEFAULT_MAX_FRAMES, bundle["trained_at"] if bundle else None
             )
             evaluation = None if force else load_cached(key)
             if evaluation is None:
@@ -332,7 +334,7 @@ with tab_batch:
                         model=model,
                         classifier_bundle=bundle,
                         classifier_override=override,
-                        **local_kwargs,
+                        whisper_model=whisper_model,
                     )
                 except Exception as exc:
                     st.error(f"{s.label}: {exc}")
