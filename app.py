@@ -19,7 +19,8 @@ from utils.evaluator import (
     DEFAULT_MODEL,
     Evaluation,
     get_client,
-    is_daily_quota,
+    ModelsUnavailable,
+    failure_reason,
     parse_model_list,
 )
 from utils.features import FEATURE_DESCRIPTIONS
@@ -76,14 +77,18 @@ def category_badge(label: str) -> str:
     )
 
 
-def gemini_error_message(exc: genai_errors.APIError) -> str:
-    if is_daily_quota(exc):
-        return "Gemini's free daily quota is used up for every configured model. It resets daily; please try again later."
-    if exc.code == 429:
-        return "Gemini's per-minute rate limit was reached. Wait a minute and try again."
-    if exc.code in (500, 503):
-        return "Gemini is overloaded right now (all configured models). Please try again in a few minutes."
-    return f"Gemini error {exc.code}: {exc.message}"
+def gemini_error_message(exc: Exception) -> str:
+    if isinstance(exc, ModelsUnavailable):
+        advice = (
+            "The free daily quota is used up for every model; it resets daily."
+            if exc.all_daily_quota
+            else "Please try again in a few minutes."
+        )
+        details = " · ".join(f"`{m}`: {failure_reason(e)}" for m, e in exc.failures)
+        return f"No Gemini model is available right now. {advice}\n\n{details}"
+    if isinstance(exc, genai_errors.APIError):
+        return f"Gemini error {exc.code}: {exc.message}"
+    return str(exc)
 
 
 # ---------- Sidebar ----------
@@ -317,7 +322,7 @@ with tab_eval:
                     whisper_model=whisper_model,
                 )
                 status.update(label="Done", state="complete")
-            except genai_errors.APIError as exc:
+            except (ModelsUnavailable, genai_errors.APIError) as exc:
                 status.update(label="Failed", state="error")
                 st.error(gemini_error_message(exc))
             except Exception as exc:
@@ -368,7 +373,7 @@ with tab_batch:
                         whisper_model=whisper_model,
                     )
                 except Exception as exc:
-                    message = gemini_error_message(exc) if isinstance(exc, genai_errors.APIError) else str(exc)
+                    message = gemini_error_message(exc)
                     st.error(f"{s.label}: {message}")
                     continue
                 evaluation, model_used = result.evaluation, result.model_used

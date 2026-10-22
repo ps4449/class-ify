@@ -17,7 +17,10 @@ from utils.features import format_features
 from utils.transcript_processor import Transcript, format_timestamp
 
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-DEFAULT_FALLBACK_MODELS = "gemini-3.7-flash,gemini-3.5-flash"
+# Each model has its own free-tier daily quota, so a longer chain means more evaluations per day.
+DEFAULT_FALLBACK_MODELS = (
+    "gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite"
+)
 MAX_RETRIES = 4
 FALLBACK_RETRIES = 2  # retries per model before moving on to the next one
 RETRYABLE_CODES = {429, 500, 503}
@@ -27,6 +30,28 @@ FALLBACK_CODES = {429, 500, 503}
 
 def is_daily_quota(exc: errors.APIError) -> bool:
     return exc.code == 429 and "PerDay" in str(exc)
+
+
+def failure_reason(exc: errors.APIError) -> str:
+    if is_daily_quota(exc):
+        return "daily quota used up"
+    if exc.code == 429:
+        return "rate limited"
+    if exc.code in (500, 503):
+        return "overloaded"
+    return f"error {exc.code}"
+
+
+class ModelsUnavailable(Exception):
+    """Every model in the chain was overloaded or out of quota."""
+
+    def __init__(self, failures: list[tuple[str, errors.APIError]]):
+        self.failures = failures
+        super().__init__("; ".join(f"{m}: {failure_reason(e)}" for m, e in failures))
+
+    @property
+    def all_daily_quota(self) -> bool:
+        return all(is_daily_quota(e) for _, e in self.failures)
 
 
 class TimestampedObservation(BaseModel):
@@ -155,14 +180,18 @@ def evaluate_class(
     )
     fallbacks = parse_model_list(DEFAULT_FALLBACK_MODELS) if fallback_models is None else fallback_models
     candidates = [model] + [m for m in fallbacks if m != model]
+    failures: list[tuple[str, errors.APIError]] = []
     for i, candidate in enumerate(candidates):
         is_last = i == len(candidates) - 1
         try:
             response = _generate(client, candidate, contents, config, MAX_RETRIES if is_last else FALLBACK_RETRIES)
             break
         except errors.APIError as exc:
-            if exc.code not in FALLBACK_CODES or is_last:
+            if exc.code not in FALLBACK_CODES:
                 raise
+            failures.append((candidate, exc))
+            if is_last:
+                raise ModelsUnavailable(failures) from exc
 
     evaluation = response.parsed or Evaluation.model_validate_json(response.text)
     evaluation.confidence_score = min(max(evaluation.confidence_score, 0.0), 1.0)
