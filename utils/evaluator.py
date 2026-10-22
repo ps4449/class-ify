@@ -17,8 +17,16 @@ from utils.features import format_features
 from utils.transcript_processor import Transcript, format_timestamp
 
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+DEFAULT_FALLBACK_MODELS = "gemini-3.7-flash,gemini-3.5-flash"
 MAX_RETRIES = 4
+FALLBACK_RETRIES = 2  # retries per model before moving on to the next one
 RETRYABLE_CODES = {429, 500, 503}
+# Overloaded (500/503) or out of quota (429); quotas are per model, so the next model may still work.
+FALLBACK_CODES = {429, 500, 503}
+
+
+def is_daily_quota(exc: errors.APIError) -> bool:
+    return exc.code == 429 and "PerDay" in str(exc)
 
 
 class TimestampedObservation(BaseModel):
@@ -115,22 +123,47 @@ def build_contents(
     return contents
 
 
-def evaluate_class(client: genai.Client, contents: list[str], model: str = DEFAULT_MODEL) -> Evaluation:
+def parse_model_list(value: str) -> list[str]:
+    return [m.strip() for m in value.split(",") if m.strip()]
+
+
+def _generate(client: genai.Client, model: str, contents: list[str], config, retries: int):
+    for attempt in range(retries):
+        try:
+            return client.models.generate_content(model=model, contents=contents, config=config)
+        except errors.APIError as exc:
+            if exc.code not in RETRYABLE_CODES or is_daily_quota(exc) or attempt == retries - 1:
+                raise
+            time.sleep(2 ** attempt * 10)
+
+
+def evaluate_class(
+    client: genai.Client,
+    contents: list[str],
+    model: str = DEFAULT_MODEL,
+    fallback_models: list[str] | None = None,
+) -> tuple[Evaluation, str]:
+    """Returns the evaluation and the model that produced it.
+
+    If a model is overloaded or out of quota, the next model in `fallback_models` is tried.
+    """
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
         response_mime_type="application/json",
         response_schema=Evaluation,
         temperature=0.2,
     )
-    for attempt in range(MAX_RETRIES):
+    fallbacks = parse_model_list(DEFAULT_FALLBACK_MODELS) if fallback_models is None else fallback_models
+    candidates = [model] + [m for m in fallbacks if m != model]
+    for i, candidate in enumerate(candidates):
+        is_last = i == len(candidates) - 1
         try:
-            response = client.models.generate_content(model=model, contents=contents, config=config)
+            response = _generate(client, candidate, contents, config, MAX_RETRIES if is_last else FALLBACK_RETRIES)
             break
         except errors.APIError as exc:
-            if exc.code not in RETRYABLE_CODES or attempt == MAX_RETRIES - 1:
+            if exc.code not in FALLBACK_CODES or is_last:
                 raise
-            time.sleep(2 ** attempt * 10)
 
     evaluation = response.parsed or Evaluation.model_validate_json(response.text)
     evaluation.confidence_score = min(max(evaluation.confidence_score, 0.0), 1.0)
-    return evaluation
+    return evaluation, candidate

@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
+from google.genai import errors as genai_errors
 
 from utils.benchmark import compare, comparisons_table, confusion_matrix, evaluation_text, summarize
 from utils.categories import LABEL_COLORS
@@ -13,7 +14,14 @@ from utils.classifier import QUALITY_ISSUE, TEACHING, load_bundle, reliable_part
 from utils.criteria import TEACHING_CRITERIA
 from utils.dataset import Sample, discover_samples
 from utils.downloader import download
-from utils.evaluator import DEFAULT_MODEL, Evaluation, get_client
+from utils.evaluator import (
+    DEFAULT_FALLBACK_MODELS,
+    DEFAULT_MODEL,
+    Evaluation,
+    get_client,
+    is_daily_quota,
+    parse_model_list,
+)
 from utils.features import FEATURE_DESCRIPTIONS
 from utils.feedback_parser import GroundTruth, parse_feedback_pdf, resolve_ground_truth
 from utils.pipeline import PipelineResult, cache_key, load_cached, run_pipeline, save_cached
@@ -68,10 +76,21 @@ def category_badge(label: str) -> str:
     )
 
 
+def gemini_error_message(exc: genai_errors.APIError) -> str:
+    if is_daily_quota(exc):
+        return "Gemini's free daily quota is used up for every configured model. It resets daily; please try again later."
+    if exc.code == 429:
+        return "Gemini's per-minute rate limit was reached. Wait a minute and try again."
+    if exc.code in (500, 503):
+        return "Gemini is overloaded right now (all configured models). Please try again in a few minutes."
+    return f"Gemini error {exc.code}: {exc.message}"
+
+
 # ---------- Sidebar ----------
 
 api_key = get_setting("GEMINI_API_KEY")
 model = get_setting("GEMINI_MODEL", DEFAULT_MODEL)
+fallback_models = parse_model_list(get_setting("GEMINI_FALLBACK_MODELS", DEFAULT_FALLBACK_MODELS))
 whisper_model = get_setting("WHISPER_MODEL", DEFAULT_WHISPER_MODEL)
 bundle = cached_bundle()
 with st.sidebar:
@@ -93,6 +112,7 @@ with st.sidebar:
         st.warning("No local classifier found. Run `python train.py`.")
     st.markdown(
         f"- Gemini model: `{model}`\n"
+        f"- Fallbacks if overloaded: {', '.join(f'`{m}`' for m in fallback_models) or 'none'}\n"
         f"- Whisper model (no transcript): `{whisper_model}`\n"
         f"- Frames: every {DEFAULT_TARGET_INTERVAL_S}s, max {DEFAULT_MAX_FRAMES} (fixed to match training)"
     )
@@ -112,6 +132,10 @@ def render_result(result: PipelineResult):
     c2.metric("Duration", f"{local.duration / 60:.0f} min")
     c3.metric("Quality issue", "Yes" if evaluation.quality_issue else "No")
     c4.metric("Local teaching rating", result.classifier.teaching_label.title() if result.classifier else "—")
+    st.caption(
+        f"Evaluated with `{result.model_used}`"
+        + (f" (fallback: `{model}` was overloaded)" if result.model_used != model else "")
+    )
     if local.transcribed:
         st.info("No transcript supplied; transcribed locally with Whisper (no speaker labels).")
     if evaluation.quality_issue:
@@ -285,6 +309,7 @@ with tab_eval:
                     video_path,
                     transcript,
                     model=model,
+                    fallback_models=fallback_models,
                     classifier_bundle=bundle,
                     classifier_override=override,
                     video_name=video_name,
@@ -292,6 +317,9 @@ with tab_eval:
                     whisper_model=whisper_model,
                 )
                 status.update(label="Done", state="complete")
+            except genai_errors.APIError as exc:
+                status.update(label="Failed", state="error")
+                st.error(gemini_error_message(exc))
             except Exception as exc:
                 status.update(label="Failed", state="error")
                 st.exception(exc)
@@ -316,15 +344,17 @@ with tab_batch:
     if st.button("Run batch", type="primary", disabled=not (api_key and selected)):
         client = cached_client(api_key)
         progress = st.progress(0.0)
-        rows: list[tuple[Sample, Evaluation, str | None]] = []
+        rows: list[tuple[Sample, Evaluation, str | None, str]] = []
         for i, s in enumerate(selected):
             progress.progress(i / len(selected), text=f"Evaluating {s.label}")
             override = bundle["loocv"].get(s.key) if bundle else None
             key = cache_key(
                 s.key, model, DEFAULT_TARGET_INTERVAL_S, DEFAULT_MAX_FRAMES, bundle["trained_at"] if bundle else None
             )
-            evaluation = None if force else load_cached(key)
-            if evaluation is None:
+            cached = None if force else load_cached(key)
+            if cached:
+                evaluation, model_used = cached
+            else:
                 try:
                     transcript = load_transcript_file(s.transcript_path) if s.transcript_path else None
                     result = run_pipeline(
@@ -332,18 +362,20 @@ with tab_batch:
                         s.video_path,
                         transcript,
                         model=model,
+                        fallback_models=fallback_models,
                         classifier_bundle=bundle,
                         classifier_override=override,
                         whisper_model=whisper_model,
                     )
                 except Exception as exc:
-                    st.error(f"{s.label}: {exc}")
+                    message = gemini_error_message(exc) if isinstance(exc, genai_errors.APIError) else str(exc)
+                    st.error(f"{s.label}: {message}")
                     continue
-                evaluation = result.evaluation
+                evaluation, model_used = result.evaluation, result.model_used
                 override = override or result.classifier
-                save_cached(key, evaluation)
+                save_cached(key, evaluation, model_used)
                 time.sleep(60 / rpm)
-            rows.append((s, evaluation, override.teaching_label if override else None))
+            rows.append((s, evaluation, override.teaching_label if override else None, model_used))
         progress.progress(1.0, text="Done")
         st.session_state["batch"] = rows
 
@@ -360,27 +392,30 @@ with tab_batch:
                         "classifier": clf,
                         "confidence": round(e.confidence_score, 2),
                         "quality_issue": e.quality_issue,
+                        "model": used,
                     }
-                    for s, e, clf in rows
+                    for s, e, clf, used in rows
                 ]
             ),
             use_container_width=True,
             hide_index=True,
         )
+        if any(used != model for *_, used in rows):
+            st.caption(f"Some recordings were evaluated with a fallback model because `{model}` was overloaded.")
 
         def candidates_for(s: Sample) -> list[GroundTruth]:
             return resolve_ground_truth(ground_truth, s.video_path.name)
 
         gemini_cmp = [
             c
-            for s, e, _ in rows
+            for s, e, _, _ in rows
             if s.video_id
             and (c := compare(s.video_id, e.predicted_category, candidates_for(s), evaluation_text(e)))
         ]
         # The classifier rates teaching only, so AV quality-issue recordings are left out.
         classifier_cmp = [
             c
-            for s, _, clf in rows
+            for s, _, clf, _ in rows
             if s.video_id
             and clf
             and (c := compare(s.video_id, clf, candidates_for(s)))

@@ -44,6 +44,7 @@ class PipelineResult:
     local: LocalAnalysis
     classifier: ClassifierPrediction | None
     evaluation: Evaluation
+    model_used: str
     sent_to_gemini: str
 
 
@@ -83,6 +84,7 @@ def run_pipeline(
     transcript: Transcript | None = None,
     *,
     model: str = DEFAULT_MODEL,
+    fallback_models: list[str] | None = None,
     classifier_bundle: dict | None = None,
     classifier_override: ClassifierPrediction | None = None,
     video_name: str | None = None,
@@ -98,7 +100,7 @@ def run_pipeline(
     on_step(f"Evaluating redacted transcript with {model}")
     estimates = prompt_estimates(classifier, classifier_bundle) if classifier else []
     contents = build_contents(local.transcript, local.features, estimates, local.duration)
-    evaluation = evaluate_class(client, contents, model)
+    evaluation, model_used = evaluate_class(client, contents, model, fallback_models)
 
     video_name = video_name or Path(video_path).name
     return PipelineResult(
@@ -107,6 +109,7 @@ def run_pipeline(
         local=local,
         classifier=classifier,
         evaluation=evaluation,
+        model_used=model_used,
         sent_to_gemini="\n\n".join(contents),
     )
 
@@ -130,12 +133,15 @@ def save_cached_features(key: str, features: dict[str, float]) -> None:
     path.write_text(json.dumps(features, indent=2))
 
 
-def load_cached(key: str) -> Evaluation | None:
+def load_cached(key: str) -> tuple[Evaluation, str] | None:
     path = _cache_path("evaluations", key)
-    return Evaluation.model_validate_json(path.read_text()) if path.exists() else None
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text())
+    return Evaluation.model_validate(data["evaluation"]), data["model_used"]
 
 
-def save_cached(key: str, evaluation: Evaluation) -> None:
+def save_cached(key: str, evaluation: Evaluation, model_used: str) -> None:
     path = _cache_path("evaluations", key)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(evaluation.model_dump_json(indent=2))
+    path.write_text(json.dumps({"model_used": model_used, "evaluation": evaluation.model_dump()}, indent=2))
